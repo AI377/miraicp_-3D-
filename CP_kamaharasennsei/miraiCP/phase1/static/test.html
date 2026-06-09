@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>Test</title>
+<style>body{margin:0;background:#111;}</style>
+</head>
+<body>
+<div id="msg" style="position:fixed;top:10px;left:10px;color:#0ff;font:16px monospace;z-index:9">起動中...</div>
+
+<script type="importmap">{ "imports": { "three": "/three.module.js" } }</script>
+
+<script type="module">
+  import * as THREE from 'three';
+
+  document.getElementById('msg').textContent = 'Three.js r' + THREE.REVISION + ' 読み込み完了 ✓';
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  const scene  = new THREE.Scene();
+  scene.background = new THREE.Color(0x223344);
+
+  const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+  camera.position.z = 3;
+
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshNormalMaterial()
+  );
+  scene.add(mesh);
+  scene.add(new THREE.AmbientLight(0xffffff));
+
+  (function loop() {
+    requestAnimationFrame(loop);
+    mesh.rotation.x += 0.01;
+    mesh.rotation.y += 0.02;
+    renderer.render(scene, camera);
+  })();
+</script>
+</body>
+</html>

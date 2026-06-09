@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>miraiCP — Hologram Control</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    #hud {
+      position: fixed; top: 16px; left: 16px;
+      color: #ccc; font: 12px/2 'Courier New', monospace;
+      pointer-events: none; user-select: none;
+    }
+    .active { color: #00e5ff; font-weight: bold; }
+    .warn   { color: #ffcc00; font-weight: bold; }
+    .dim    { color: #444; }
+    .tiny   { font-size: 10px; color: #333; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div id="ws-status" class="dim">接続待機中...</div>
+    <div id="g-state"  class="dim">STATE : IDLE</div>
+    <div id="g-swipe"  class="dim">SWIPE : ---</div>
+    <div id="g-zoom"   class="dim">ZOOM  : ---</div>
+    <div id="g-2hand"  class="dim">2HAND : ---</div>
+    <div id="g-hand"   class="dim">手検出 : ---</div>
+    <div id="g-rot"    class="tiny">rot: ---</div>
+    <div id="accel-r"  class="tiny">右accel: ---</div>
+    <div id="accel-l"  class="tiny">左accel: ---</div>
+  </div>
+
+  <script type="importmap">{ "imports": { "three": "/three.module.js" } }</script>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    // ── MediaPipe 骨格接続 ────────────────────────────────────
+    const CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],
+      [13,17],[17,18],[18,19],[19,20],
+      [0,17],
+    ];
+    const SCALE      = 4;
+    const ACCEL_NORM = 1024;
+    const INERTIA    = 0.94;   // 慣性減衰（投擲・スワイプ後）
+    const POS_K      = 0.12;   // バネ強さ（位置）
+    const POS_D      = 0.80;   // バネ減衰（位置）
+    const ROT_K      = 0.25;   // バネ強さ（回転）
+
+    // ── シーン ───────────────────────────────────────────────
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x050510);
+    scene.fog = new THREE.Fog(0x050510, 14, 28);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(0, 0, 9);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+    const dl = new THREE.DirectionalLight(0x66aaff, 2.2);
+    dl.position.set(5, 8, 6);
+    scene.add(dl);
+    const rl = new THREE.DirectionalLight(0xff4400, 0.6);
+    rl.position.set(-6, -4, -4);
+    scene.add(rl);
+
+    const grid = new THREE.GridHelper(26, 26, 0x0c0c22, 0x0c0c22);
+    grid.position.y = -4;
+    scene.add(grid);
+
+    const ringMesh = new THREE.Mesh(
+      new THREE.RingGeometry(2.2, 2.3, 80),
+      new THREE.MeshBasicMaterial({
+        color: 0x0044ff, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
+      })
+    );
+    ringMesh.rotation.x = -Math.PI / 2;
+    ringMesh.position.y = -3.9;
+    scene.add(ringMesh);
+
+    // ── ホログラムオブジェクト ───────────────────────────────
+    const objGroup = new THREE.Group();
+    scene.add(objGroup);
+
+    const holoMat = new THREE.MeshStandardMaterial({
+      color: 0x22aaff, emissive: 0x0044bb, emissiveIntensity: 0.6,
+      transparent: true, opacity: 0.75, metalness: 0.15, roughness: 0.45,
+    });
+    objGroup.add(new THREE.Mesh(
+      new THREE.TorusKnotGeometry(0.85, 0.27, 180, 28), holoMat
+    ));
+
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: 0x0066ff, side: THREE.BackSide,
+      transparent: true, opacity: 0.25, blending: THREE.AdditiveBlending,
+    });
+    const glowMesh = new THREE.Mesh(
+      new THREE.TorusKnotGeometry(0.85, 0.27, 180, 28), glowMat
+    );
+    glowMesh.scale.setScalar(1.09);
+    objGroup.add(glowMesh);
+
+    // ── トレイル ──────────────────────────────────────────────
+    const TRAIL_MAX = 50;
+    const trailPts  = [new THREE.Vector3(), new THREE.Vector3()];
+    const trailGeo  = new THREE.BufferGeometry().setFromPoints(trailPts);
+    scene.add(new THREE.Line(trailGeo, new THREE.LineBasicMaterial({
+      color: 0x00aaff, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending,
+    })));
+
+    // ── HandModel ─────────────────────────────────────────────
+    class HandModel {
+      constructor(jColor, bColor) {
+        this.group = new THREE.Group();
+        this.group.visible = false;
+        scene.add(this.group);
+        const jMat = new THREE.MeshPhongMaterial({ color: jColor, emissive: jColor, emissiveIntensity: 0.3 });
+        this.joints = Array.from({ length: 21 }, () => {
+          const m = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), jMat);
+          this.group.add(m); return m;
+        });
+        [4,8,12,16,20].forEach(i => this.joints[i].scale.setScalar(1.4));
+        [5,9,13,17].forEach(i => this.joints[i].scale.setScalar(1.2));
+        const bArr = new Float32Array(CONNECTIONS.length * 6);
+        this.bGeo  = new THREE.BufferGeometry();
+        this.bGeo.setAttribute('position', new THREE.BufferAttribute(bArr, 3));
+        this.group.add(new THREE.LineSegments(
+          this.bGeo, new THREE.LineBasicMaterial({ color: bColor })
+        ));
+        this.landmarks = null;
+      }
+      update(lm) {
+        this.landmarks = lm;
+        if (!lm) { this.group.visible = false; return; }
+        this.group.visible = true;
+        const [wx, wy] = lm[0];
+        this.group.position.set((wx - 0.5) * SCALE, -(wy - 0.5) * SCALE, 0);
+        const pos = this.bGeo.attributes.position.array;
+        lm.forEach((p, i) => this.joints[i].position.set(
+          (p[0] - wx) * SCALE, -(p[1] - wy) * SCALE, -(p[2] - lm[0][2]) * SCALE * 2
+        ));
+        CONNECTIONS.forEach(([a, b], i) => {
+          const pa = this.joints[a].position, pb = this.joints[b].position;
+          pos.set([pa.x, pa.y, pa.z, pb.x, pb.y, pb.z], i * 6);
+        });
+        this.bGeo.attributes.position.needsUpdate = true;
+      }
+      applyAccel(ax, ay, az) {
+        if (!this.group.visible) return;
+        const nx = ax / ACCEL_NORM, ny = ay / ACCEL_NORM, nz = az / ACCEL_NORM;
+        this.group.rotation.x =  Math.atan2(-nx, Math.sqrt(ny*ny + nz*nz)) * 0.45;
+        this.group.rotation.z =  Math.atan2(ny, -nz) * 0.45;
+      }
+    }
+
+    const rightHand = new HandModel(0xff7733, 0xff5500);
+    const leftHand  = new HandModel(0x33ccff, 0x0099ff);
+
+    // ── ユーティリティ ────────────────────────────────────────
+
+    // パー判定：3本以上の指が伸びている
+    function isOpen(lm) {
+      if (!lm) return false;
+      const TIPS = [8,12,16,20], PIPS = [6,10,14,18];
+      return TIPS.filter((t, i) => lm[t][1] < lm[PIPS[i]][1]).length >= 3;
+    }
+
+    // 左手グリップ判定（シンプル版）
+    function isGrip(lm) {
+      if (!lm) return false;
+      const TIPS = [8,12,16,20], PIPS = [6,10,14,18];
+      return TIPS.filter((t, i) => lm[t][1] > lm[PIPS[i]][1]).length >= 3;
+    }
+
+    // 右手グリップ：カウンター方式（素早くON、ゆっくりOFF でブレを防ぐ）
+    // 3本以上曲がっていればカウントアップ、それ以外はカウントダウン
+    let gripCounter = 0;
+
+    function updateGrip(lm) {
+      const TIPS = [8,12,16,20], PIPS = [6,10,14,18];
+      const bent = lm ? TIPS.filter((t, i) => lm[t][1] > lm[PIPS[i]][1]).length : 0;
+      if (bent >= 3) {
+        gripCounter = Math.min(gripCounter + 2, 10);  // 素早くON
+      } else {
+        gripCounter = Math.max(gripCounter - 3, 0);   // 素早くOFF（ズームしやすく）
+      }
+      return gripCounter >= 6;
+    }
+
+    // 加速度から腕の傾き角度を算出（ローパスフィルタでノイズ低減）
+    // pitch = 前後傾き(X回転), roll = 左右傾き(Z回転), yaw = 水平面での向き(Y回転)
+    let smoothPitch = 0, smoothRoll = 0, smoothYaw = 0;
+    const ACCEL_SMOOTH = 0.25;
+
+    function accelAngles(ax, ay, az) {
+      const n = Math.sqrt(ax*ax + ay*ay + az*az) || 1;
+      const nx = ax/n, ny = ay/n, nz = az/n;
+      const rawPitch = Math.atan2(-nx, Math.sqrt(ny*ny + nz*nz));
+      const rawRoll  = Math.atan2(ny, -nz);
+      const rawYaw   = Math.atan2(nx, ny);  // 水平面内での腕の向き
+      smoothPitch += (rawPitch - smoothPitch) * ACCEL_SMOOTH;
+      smoothRoll  += (rawRoll  - smoothRoll)  * ACCEL_SMOOTH;
+      smoothYaw   += (rawYaw   - smoothYaw)   * ACCEL_SMOOTH;
+      return { pitch: smoothPitch, roll: smoothRoll, yaw: smoothYaw };
+    }
+
+    // ── オブジェクト物理状態 ──────────────────────────────────
+    const pos     = new THREE.Vector3();
+    const vel     = new THREE.Vector3();
+    let rotX = 0, rotY = 0, rotZ = 0;
+    let angVelX = 0, angVelY = 0, angVelZ = 0;
+    let scale = 1, targetScale = 1;
+    let refDist = null, zoomBaseScale = 1;
+    let twoHandMode = null;   // 'zoom' | 'rot' | null
+    let prevTwoD    = null;
+
+    // グリップ状態
+    let grabbing      = false;
+    let gripOffset    = new THREE.Vector3();
+    let gripRefPitch  = 0, gripRefRoll = 0, gripRefYaw = 0;
+    let gripObjX      = 0, gripObjY = 0, gripObjZ = 0;
+    let targetRotX    = 0, targetRotY = 0, targetRotZ = 0;
+
+    // スワイプ状態
+    let prevWX = null, prevWY = null;
+    let swipeCooldown = false;
+
+    // 両手回転状態
+    let prevTwoAngle = null;
+
+    // ── ジェスチャー処理 ─────────────────────────────────────
+    function processGestures(data) {
+      const rlm   = data.right.landmarks;
+      const llm   = data.left.landmarks;
+      const rGrip = updateGrip(rlm);
+      const lGrip = isGrip(llm);
+      const ra    = data.right.accel;
+      // Micro:bit加速度センサーのみで3軸回転を算出
+      const { pitch, roll, yaw } = accelAngles(ra.x, ra.y, ra.z);
+
+      // ═══ 1位: GRAB（グリップ）══════════════════════════════
+      if (rGrip && rlm) {
+        hud('g-state', 'STATE : GRAB ✊', 'warn');
+        hud('g-swipe', 'SWIPE : ---', 'dim');
+
+        if (!grabbing) {
+          grabbing = true;
+          const wx = (rlm[0][0] - 0.5) * SCALE;
+          const wy = -(rlm[0][1] - 0.5) * SCALE;
+          const wz = ra.x / ACCEL_NORM * 2;
+          gripOffset.set(wx - pos.x, wy - pos.y, wz - pos.z);
+          gripRefPitch = pitch; gripRefRoll = roll; gripRefYaw = yaw;
+          gripObjX = rotX; gripObjY = rotY; gripObjZ = rotZ;
+        }
+
+        const wx  = (rlm[0][0] - 0.5) * SCALE;
+        const wy  = -(rlm[0][1] - 0.5) * SCALE;
+        const wz  = ra.x / ACCEL_NORM * 2;
+        vel.x += (wx - gripOffset.x - pos.x) * POS_K;
+        vel.y += (wy - gripOffset.y - pos.y) * POS_K;
+        vel.z += (wz - gripOffset.z - pos.z) * POS_K;
+
+        targetRotY = gripObjY + (yaw   - gripRefYaw)   *  8.0;  // Micro:bit accel yaw
+        targetRotX = gripObjX + (pitch - gripRefPitch) * 15.0;  // Micro:bit accel pitch
+        targetRotZ = gripObjZ + (roll  - gripRefRoll)  * 15.0;  // Micro:bit accel roll
+
+        const drotX = (targetRotX - rotX) * ROT_K;
+        const drotY = (targetRotY - rotY) * ROT_K;
+        const drotZ = (targetRotZ - rotZ) * ROT_K;
+        angVelX = drotX; angVelY = drotY; angVelZ = drotZ;
+        rotX += drotX; rotY += drotY; rotZ += drotZ;
+
+        refDist = null; prevTwoAngle = null;
+        prevWX = rlm[0][0]; prevWY = rlm[0][1];
+
+      } else {
+        // グラブ解除 → 投擲
+        if (grabbing) {
+          grabbing = false;
+          hud('g-state', 'STATE : THROW →', 'active');
+          setTimeout(() => hud('g-state', 'STATE : IDLE', 'dim'), 800);
+        }
+
+        // ═══ 5位: 慣性（常にパッシブ）═══════════════════════════
+        angVelX *= INERTIA; angVelY *= INERTIA; angVelZ *= INERTIA;
+        rotX += angVelX;    rotY += angVelY;    rotZ += angVelZ;
+        vel.multiplyScalar(POS_D * INERTIA);
+
+        if (rlm && llm && !lGrip) {
+          // ═══ 2位: ZOOM / 4位: 2HAND ROT（排他・最初の動きで決定）
+          const d     = Math.hypot(rlm[0][0]-llm[0][0], rlm[0][1]-llm[0][1]);
+          const angle = Math.atan2(llm[0][1]-rlm[0][1], llm[0][0]-rlm[0][0]);
+
+          if (refDist === null) {
+            refDist = d; zoomBaseScale = scale;
+            prevTwoAngle = angle; prevTwoD = d;
+            twoHandMode = null;  // まだ未決定
+          }
+
+          const dDist = Math.abs(d - prevTwoD);
+          let da = angle - prevTwoAngle;
+          if (da >  Math.PI) da -= 2 * Math.PI;
+          if (da < -Math.PI) da += 2 * Math.PI;
+          const dAng = Math.abs(da);
+
+          // 最初の明確な動きでズームか回転かを決定する
+          if (twoHandMode === null) {
+            if (dDist > 0.012 && dDist > dAng * 0.08) twoHandMode = 'zoom';
+            else if (dAng > 0.025 && dAng * 0.08 > dDist) twoHandMode = 'rot';
+          }
+
+          if (twoHandMode === 'zoom') {
+            // 離れる→拡大 / 近づく→縮小
+            const r = d / refDist;
+            targetScale = THREE.MathUtils.clamp(zoomBaseScale * r, 0.1, 6);
+            hud('g-zoom',  `ZOOM  : ${targetScale.toFixed(2)}×`, 'active');
+            hud('g-2hand', '2HAND : ---', 'dim');
+          } else if (twoHandMode === 'rot') {
+            // 両手回転
+            if (dAng > 0.008) angVelY += da * 1.5;
+            hud('g-2hand', '2HAND : ROT ↻', 'active');
+            hud('g-zoom',  'ZOOM  : ---', 'dim');
+          } else {
+            hud('g-zoom',  'ZOOM  : 待機中…', 'dim');
+            hud('g-2hand', '2HAND : 待機中…', 'dim');
+          }
+
+          prevTwoD = d; prevTwoAngle = angle;
+
+        } else {
+          refDist = null; prevTwoAngle = null; prevTwoD = null; twoHandMode = null;
+          hud('g-zoom',  'ZOOM  : ---', 'dim');
+          hud('g-2hand', '2HAND : ---', 'dim');
+
+          // ═══ 3位: SWIPE（パー＋素早い払い）════════════════════
+          if (rlm && !swipeCooldown && isOpen(rlm)) {
+            if (prevWX !== null) {
+              const vx = rlm[0][0] - prevWX;
+              const vy = rlm[0][1] - prevWY;
+              if (Math.abs(vx) > 0.12 || Math.abs(vy) > 0.12) {
+                if (Math.abs(vx) >= Math.abs(vy)) {
+                  rotY = Math.round(rotY / (Math.PI/2)) * (Math.PI/2)
+                       + (vx > 0 ? 1 : -1) * (Math.PI/2);
+                  angVelY = vx * 3.5;
+                } else {
+                  rotX = Math.round(rotX / (Math.PI/2)) * (Math.PI/2)
+                       + (vy > 0 ? 1 : -1) * (Math.PI/2);
+                  angVelX = vy * 3.5;
+                }
+                swipeCooldown = true;
+                setTimeout(() => swipeCooldown = false, 450);
+                hud('g-swipe', 'SWIPE : スナップ ⚡', 'active', 700);
+                hud('g-state', 'STATE : SWIPE ⚡', 'active', 500);
+              }
+            }
+            prevWX = rlm[0][0]; prevWY = rlm[0][1];
+          } else if (!rlm) {
+            prevWX = null; prevWY = null;
+          }
+        }
+
+        if (!grabbing) hud('g-state', 'STATE : IDLE', 'dim');
+      }
+
+      // 手検出状態
+      const handStatus = (rlm ? '右✓' : '右✗') + '  ' + (llm ? '左✓' : '左✗')
+                       + '  GRIP:' + (rGrip ? '✊' : '✋');
+      hud('g-hand', '手検出 : ' + handStatus, (rlm || llm) ? 'active' : 'dim');
+
+      // 回転デバッグ
+      document.getElementById('g-rot').textContent =
+        `rot P=${pitch.toFixed(2)} R=${roll.toFixed(2)} Y=${yaw.toFixed(2)}`;
+
+      // accel HUD
+      document.getElementById('accel-r').textContent =
+        `右: ${ra.x} ${ra.y} ${ra.z}`;
+      document.getElementById('accel-l').textContent =
+        `左: ${data.left.accel.x} ${data.left.accel.y} ${data.left.accel.z}`;
+    }
+
+    // ── HUD ヘルパー ─────────────────────────────────────────
+    const hudT = {};
+    function hud(id, text, cls, ms = 0) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      clearTimeout(hudT[id]);
+      el.textContent = text; el.className = cls;
+      if (ms) hudT[id] = setTimeout(() => { el.className = 'dim'; }, ms);
+    }
+
+    // ── WebSocket ─────────────────────────────────────────────
+    function connect() {
+      const ws = new WebSocket('ws://localhost:8000/ws');
+      ws.onopen    = () => hud('ws-status', '接続OK ✓', 'active');
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        rightHand.update(data.right.landmarks);
+        leftHand.update(data.left.landmarks);
+        rightHand.applyAccel(data.right.accel.x, data.right.accel.y, data.right.accel.z);
+        leftHand.applyAccel(data.left.accel.x,   data.left.accel.y,  data.left.accel.z);
+        processGestures(data);
+      };
+      ws.onclose = () => {
+        hud('ws-status', '切断 — 再接続中...', 'dim');
+        setTimeout(connect, 2000);
+      };
+    }
+    connect();
+
+    // ── アニメーション ────────────────────────────────────────
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+
+      // 位置：バネ物理
+      vel.multiplyScalar(POS_D);
+      pos.add(vel);
+
+      // スケール補間
+      scale += (targetScale - scale) * 0.12;
+
+      // オブジェクトに反映
+      objGroup.position.copy(pos);
+      objGroup.rotation.set(rotX, rotY, rotZ);
+      objGroup.scale.setScalar(scale);
+
+      // グラブ中はホログラム色が変わる
+      holoMat.emissive.setHex(grabbing ? 0x003366 : 0x0044bb);
+      holoMat.opacity = (grabbing ? 0.85 : 0.72) + Math.sin(t * 2.5) * 0.04;
+      holoMat.emissiveIntensity = (grabbing ? 1.0 : 0.6) + Math.sin(t * 4) * 0.2;
+      glowMat.opacity = grabbing ? 0.45 : 0.25;
+
+      // トレイル
+      trailPts.push(objGroup.position.clone());
+      if (trailPts.length > TRAIL_MAX) trailPts.shift();
+      if (trailPts.length >= 2) trailGeo.setFromPoints(trailPts);
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+  </script>
+</body>
+</html>
