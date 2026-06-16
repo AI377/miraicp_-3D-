@@ -15,6 +15,50 @@
     .warn   { color: #ffcc00; font-weight: bold; }
     .dim    { color: #444; }
     .tiny   { font-size: 10px; color: #333; }
+    #tol-notify {
+      position: fixed; top: 38%; left: 50%; transform: translateX(-50%);
+      background: rgba(0,40,120,0.92); color: #fff;
+      padding: 14px 32px; border-radius: 8px; border: 1px solid #0ff;
+      font: bold 16px 'Courier New', monospace; text-align: center;
+      display: none; z-index: 30; pointer-events: none;
+      text-shadow: 0 0 6px #0ff; box-shadow: 0 0 20px #0ff4;
+    }
+
+    /* ── ゲームUI ─────────────────────────────────────── */
+    #start-overlay {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      z-index: 10; pointer-events: none;
+    }
+    #start-btn {
+      width: 110px; height: 110px; border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%, #ff5555, #cc0000);
+      border: 3px solid #ff8888; color: #fff;
+      font-size: 16px; font-weight: bold; cursor: pointer;
+      pointer-events: all;
+      box-shadow: 0 0 40px #ff333388, 0 0 80px #ff000044;
+      transition: transform .1s;
+    }
+    #start-btn:hover { transform: scale(1.08); }
+    #game-hud {
+      display: none;
+      position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+      color: #0ff; font: bold 14px 'Courier New', monospace;
+      text-align: center; pointer-events: none;
+      text-shadow: 0 0 8px #0ff;
+    }
+    #task-label { font-size: 16px; margin-bottom: 6px; }
+    #hold-wrap  { width: 280px; height: 10px; background: #222; border-radius: 5px; margin: 0 auto; }
+    #hold-fill  { height: 100%; width: 0%; background: #00ff88; border-radius: 5px; transition: background .2s; }
+    #hold-fill.matched { background: #00ffcc; box-shadow: 0 0 8px #00ffcc; }
+    #task-result {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.75);
+      flex-direction: column; align-items: center; justify-content: center;
+      color: #fff; font-family: 'Courier New', monospace;
+      z-index: 20; gap: 10px;
+    }
   </style>
 </head>
 <body>
@@ -28,7 +72,27 @@
     <div id="g-rot"    class="tiny">rot: ---</div>
     <div id="accel-r"  class="tiny">右accel: ---</div>
     <div id="accel-l"  class="tiny">左accel: ---</div>
+    <div id="g-mouse"  class="dim">MOUSE : ---</div>
+    <div id="g-camtog" class="active">MODE: CAMERA [C] / MOUSE [M]</div>
   </div>
+
+  <!-- ゲーム：スタートボタン -->
+  <div id="start-overlay">
+    <button id="start-btn">▶<br>START</button>
+  </div>
+
+  <!-- ゲームHUD -->
+  <div id="game-hud">
+    <div id="task-label"></div>
+    <div id="hold-wrap"><div id="hold-fill"></div></div>
+    <div id="cur-state" style="margin-top:8px;font-size:13px;color:#aaa;line-height:1.7"></div>
+  </div>
+
+  <!-- タスク完了 / 最終結果オーバーレイ -->
+  <div id="task-result"></div>
+
+  <!-- 閾値変更通知 -->
+  <div id="tol-notify"></div>
 
   <script type="importmap">{ "imports": { "three": "/three.module.js" } }</script>
 
@@ -46,10 +110,10 @@
     ];
     const SCALE      = 4;
     const ACCEL_NORM = 1024;
-    const INERTIA    = 0.94;   // 慣性減衰（投擲・スワイプ後）
-    const POS_K      = 0.12;   // バネ強さ（位置）
-    const POS_D      = 0.80;   // バネ減衰（位置）
-    const ROT_K      = 0.25;   // バネ強さ（回転）
+    const INERTIA    = 0.94;
+    const POS_K      = 0.12;
+    const POS_D      = 0.80;
+    const ROT_K      = 0.25;
 
     // ── シーン ───────────────────────────────────────────────
     const scene = new THREE.Scene();
@@ -166,37 +230,28 @@
 
     // ── ユーティリティ ────────────────────────────────────────
 
-    // パー判定：3本以上の指が伸びている
     function isOpen(lm) {
       if (!lm) return false;
       const TIPS = [8,12,16,20], PIPS = [6,10,14,18];
       return TIPS.filter((t, i) => lm[t][1] < lm[PIPS[i]][1]).length >= 3;
     }
 
-    // 左手グリップ判定（シンプル版）
     function isGrip(lm) {
       if (!lm) return false;
       const TIPS = [8,12,16,20], PIPS = [6,10,14,18];
       return TIPS.filter((t, i) => lm[t][1] > lm[PIPS[i]][1]).length >= 3;
     }
 
-    // 右手グリップ：カウンター方式（素早くON、ゆっくりOFF でブレを防ぐ）
-    // 3本以上曲がっていればカウントアップ、それ以外はカウントダウン
     let gripCounter = 0;
-
     function updateGrip(lm) {
       const TIPS = [8,12,16,20], PIPS = [6,10,14,18];
       const bent = lm ? TIPS.filter((t, i) => lm[t][1] > lm[PIPS[i]][1]).length : 0;
-      if (bent >= 3) {
-        gripCounter = Math.min(gripCounter + 2, 10);  // 素早くON
-      } else {
-        gripCounter = Math.max(gripCounter - 3, 0);   // 素早くOFF（ズームしやすく）
-      }
+      if (bent >= 3) { gripCounter = Math.min(gripCounter + 2, 10); }
+      else           { gripCounter = Math.max(gripCounter - 3, 0); }
       return gripCounter >= 6;
     }
 
-    // 加速度から腕の傾き角度を算出（ローパスフィルタでノイズ低減）
-    // pitch = 前後傾き(X回転), roll = 左右傾き(Z回転), yaw = 水平面での向き(Y回転)
+    // 加速度から3軸角度（Micro:bitのみ・ローパスフィルタ付き）
     let smoothPitch = 0, smoothRoll = 0, smoothYaw = 0;
     const ACCEL_SMOOTH = 0.25;
 
@@ -219,27 +274,43 @@
     let angVelX = 0, angVelY = 0, angVelZ = 0;
     let scale = 1, targetScale = 1;
     let refDist = null, zoomBaseScale = 1;
-    let twoHandMode = null;   // 'zoom' | 'rot' | null
+    let twoHandMode = null;
     let prevTwoD    = null;
 
-    // グリップ状態
     let grabbing      = false;
     let gripOffset    = new THREE.Vector3();
     let gripRefPitch  = 0, gripRefRoll = 0, gripRefYaw = 0;
     let gripObjX      = 0, gripObjY = 0, gripObjZ = 0;
     let targetRotX    = 0, targetRotY = 0, targetRotZ = 0;
 
-    // スワイプ状態
     let prevWX = null, prevWY = null;
     let swipeCooldown = false;
 
-    // 両手回転状態
     let prevTwoAngle = null;
+
+    // ── 入力モード: 'camera' | 'mouse' ───────────────────────
+    let inputMode = 'camera';
+
+    // ── マウス操作用状態 ──────────────────────────────────────
+    let savedTransform = { px:0, py:0, pz:0, rx:0, ry:0, rz:0, sc:1 };
+    let camTheta = 0, camPhi = Math.PI / 2;  // π/2 = 初期カメラ位置(0,0,9)
+    const CAM_RADIUS    = 9;
+    let mouseDrag       = false;
+    let mouseOrbit      = false;
+    let mouseStartX     = 0, mouseStartY = 0;
+    let mousePosStartX  = 0, mousePosStartY = 0;
+    // 右ドラッグ回転
+    let mouseRotate     = false;
+    let mouseRightX     = 0, mouseRightY = 0;
+    let mouseRightMoved = false;
+    let mouseRotObjX    = 0, mouseRotObjY = 0, mouseRotObjZ = 0;
+    let zAxisLock       = false;
 
     // ── ジェスチャー処理 ─────────────────────────────────────
     function processGestures(data) {
-      const rlm   = data.right.landmarks;
-      const llm   = data.left.landmarks;
+      // マウスモード時はランドマークを無視（カメラは常時ON）
+      const rlm   = inputMode === 'camera' ? data.right.landmarks : null;
+      const llm   = inputMode === 'camera' ? data.left.landmarks  : null;
       const rGrip = updateGrip(rlm);
       const lGrip = isGrip(llm);
       const ra    = data.right.accel;
@@ -268,9 +339,9 @@
         vel.y += (wy - gripOffset.y - pos.y) * POS_K;
         vel.z += (wz - gripOffset.z - pos.z) * POS_K;
 
-        targetRotY = gripObjY + (yaw   - gripRefYaw)   *  8.0;  // Micro:bit accel yaw
-        targetRotX = gripObjX + (pitch - gripRefPitch) * 15.0;  // Micro:bit accel pitch
-        targetRotZ = gripObjZ + (roll  - gripRefRoll)  * 15.0;  // Micro:bit accel roll
+        targetRotY = gripObjY + (yaw   - gripRefYaw)   *  1.0;
+        targetRotX = gripObjX + (pitch - gripRefPitch) *  1.875;
+        targetRotZ = gripObjZ + (roll  - gripRefRoll)  *  1.875;
 
         const drotX = (targetRotX - rotX) * ROT_K;
         const drotY = (targetRotY - rotY) * ROT_K;
@@ -302,7 +373,7 @@
           if (refDist === null) {
             refDist = d; zoomBaseScale = scale;
             prevTwoAngle = angle; prevTwoD = d;
-            twoHandMode = null;  // まだ未決定
+            twoHandMode = null;
           }
 
           const dDist = Math.abs(d - prevTwoD);
@@ -311,20 +382,17 @@
           if (da < -Math.PI) da += 2 * Math.PI;
           const dAng = Math.abs(da);
 
-          // 最初の明確な動きでズームか回転かを決定する
           if (twoHandMode === null) {
             if (dDist > 0.012 && dDist > dAng * 0.08) twoHandMode = 'zoom';
             else if (dAng > 0.025 && dAng * 0.08 > dDist) twoHandMode = 'rot';
           }
 
           if (twoHandMode === 'zoom') {
-            // 離れる→拡大 / 近づく→縮小
             const r = d / refDist;
             targetScale = THREE.MathUtils.clamp(zoomBaseScale * r, 0.1, 6);
             hud('g-zoom',  `ZOOM  : ${targetScale.toFixed(2)}×`, 'active');
             hud('g-2hand', '2HAND : ---', 'dim');
           } else if (twoHandMode === 'rot') {
-            // 両手回転
             if (dAng > 0.008) angVelY += da * 1.5;
             hud('g-2hand', '2HAND : ROT ↻', 'active');
             hud('g-zoom',  'ZOOM  : ---', 'dim');
@@ -375,11 +443,8 @@
                        + '  GRIP:' + (rGrip ? '✊' : '✋');
       hud('g-hand', '手検出 : ' + handStatus, (rlm || llm) ? 'active' : 'dim');
 
-      // 回転デバッグ
       document.getElementById('g-rot').textContent =
         `rot P=${pitch.toFixed(2)} R=${roll.toFixed(2)} Y=${yaw.toFixed(2)}`;
-
-      // accel HUD
       document.getElementById('accel-r').textContent =
         `右: ${ra.x} ${ra.y} ${ra.z}`;
       document.getElementById('accel-l').textContent =
@@ -415,6 +480,498 @@
     }
     connect();
 
+    // ── マウス操作 ─────────────────────────────────────────────
+    // 左ドラッグ: オブジェクト移動 / 中ドラッグ: カメラOrbit
+    // ホイール: スケール / 右クリック: Cancel / Enter: Commit / Esc: Cancel
+    const DRAG_SENS = 8;
+    renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+    renderer.domElement.addEventListener('mousedown', e => {
+      if (inputMode !== 'mouse') return;
+      if (e.button === 0) {
+        // 左ドラッグ：移動（Shift押しで軸ロック）
+        mouseDrag = true;
+        mouseStartX = e.clientX; mouseStartY = e.clientY;
+        mousePosStartX = pos.x;  mousePosStartY = pos.y;
+        hud('g-mouse', e.shiftKey ? 'MOUSE : DRAG+AXIS ✥' : 'MOUSE : DRAG ✥', 'active');
+      } else if (e.button === 1) {
+        // 中ドラッグ：カメラOrbit
+        e.preventDefault();
+        mouseOrbit = true;
+        mouseStartX = e.clientX; mouseStartY = e.clientY;
+        hud('g-mouse', 'MOUSE : ORBIT ↻', 'active');
+      } else if (e.button === 2) {
+        // 右：ドラッグ→回転 / クリック→Cancel（mousemoveで判定）
+        mouseRightX = e.clientX; mouseRightY = e.clientY;
+        mouseRightMoved = false;
+        mouseRotObjX = rotX; mouseRotObjY = rotY; mouseRotObjZ = rotZ;
+      }
+    });
+
+    renderer.domElement.addEventListener('mousemove', e => {
+      if (inputMode !== 'mouse') return;
+      if (mouseDrag) {
+        // 左ドラッグ移動（Shiftで軸ロック）
+        let dx = (e.clientX - mouseStartX) / innerWidth  *  DRAG_SENS;
+        let dy = -(e.clientY - mouseStartY) / innerHeight *  DRAG_SENS;
+        if (e.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0; else dx = 0;
+          hud('g-mouse', 'MOUSE : AXIS-LOCK ✥', 'active');
+        }
+        pos.x = mousePosStartX + dx;
+        pos.y = mousePosStartY + dy;
+        vel.set(0, 0, 0);
+      } else if (mouseOrbit) {
+        // 中ドラッグ：カメラOrbit
+        const dx = (e.clientX - mouseStartX) / innerWidth;
+        const dy = (e.clientY - mouseStartY) / innerHeight;
+        camTheta += dx * Math.PI;
+        camPhi    = THREE.MathUtils.clamp(camPhi + dy * Math.PI, 0.2, Math.PI - 0.2);
+        mouseStartX = e.clientX; mouseStartY = e.clientY;
+        camera.position.setFromSphericalCoords(CAM_RADIUS, camPhi, camTheta);
+        camera.lookAt(0, 0, 0);
+      } else if (e.buttons === 2) {
+        // 右ドラッグ：回転（水平→Y軸、垂直→X軸）
+        const d = Math.hypot(e.clientX - mouseRightX, e.clientY - mouseRightY);
+        if (d > 5) {
+          mouseRightMoved = true;
+          mouseRotate = true;
+        }
+        if (mouseRotate) {
+          const dx = (e.clientX - mouseRightX) / innerWidth;
+          const dy = (e.clientY - mouseRightY) / innerHeight;
+          if (zAxisLock) {
+            rotZ = mouseRotObjZ + dx * Math.PI * 3;
+            hud('g-mouse', 'MOUSE : ROT-Z [Z] ↻', 'active');
+          } else {
+            rotY = mouseRotObjY + dx * Math.PI * 3;
+            rotX = mouseRotObjX + dy * Math.PI * 3;
+            hud('g-mouse', 'MOUSE : ROT ↻', 'active');
+          }
+          angVelX = 0; angVelY = 0; angVelZ = 0;
+        }
+      }
+    });
+
+    renderer.domElement.addEventListener('mouseup', e => {
+      if (e.button === 0 && mouseDrag)  { mouseDrag  = false; hud('g-mouse', 'MOUSE : ---', 'dim'); }
+      if (e.button === 1 && mouseOrbit) { mouseOrbit = false; hud('g-mouse', 'MOUSE : ---', 'dim'); }
+      if (e.button === 2) {
+        if (!mouseRightMoved) {
+          // クリック（ドラッグなし）→ Cancel
+          pos.set(savedTransform.px, savedTransform.py, savedTransform.pz);
+          rotX = savedTransform.rx; rotY = savedTransform.ry; rotZ = savedTransform.rz;
+          targetScale = savedTransform.sc;
+          vel.set(0,0,0); angVelX = angVelY = angVelZ = 0;
+          hud('g-mouse', 'MOUSE : CANCEL ↩', 'warn', 1000);
+        }
+        mouseRotate = false; mouseRightMoved = false;
+        if (!mouseRightMoved) setTimeout(() => hud('g-mouse', 'MOUSE : ---', 'dim'), 1000);
+        else hud('g-mouse', 'MOUSE : ---', 'dim');
+      }
+    });
+
+    renderer.domElement.addEventListener('wheel', e => {
+      e.preventDefault();
+      if (inputMode !== 'mouse') return;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      targetScale = THREE.MathUtils.clamp(targetScale * factor, 0.1, 6);
+      hud('g-mouse', `MOUSE : ZOOM ${targetScale.toFixed(2)}×`, 'active', 500);
+    }, { passive: false });
+
+    window.addEventListener('keydown', e => {
+      if (e.key === 'c' || e.key === 'C') {
+        inputMode = 'camera';
+        const el = document.getElementById('g-camtog');
+        el.textContent = 'MODE: CAMERA ✓ [C/M]'; el.className = 'active';
+      }
+      if (e.key === 'm' || e.key === 'M') {
+        inputMode = 'mouse';
+        const el = document.getElementById('g-camtog');
+        el.textContent = 'MODE: MOUSE  ✓ [C/M]'; el.className = 'warn';
+        hud('g-state', 'STATE : IDLE', 'dim');
+        hud('g-hand',  '手検出 : ---', 'dim');
+      }
+      // Fキー：Y軸スナップ90°回転
+      if ((e.key === 'f' || e.key === 'F') && inputMode === 'mouse') {
+        rotY = Math.round(rotY / (Math.PI/2)) * (Math.PI/2) + Math.PI/2;
+        angVelY = 1.5;
+        hud('g-mouse', 'MOUSE : SNAP-Y ⚡', 'active', 500);
+      }
+      // Zキー：Z軸ロック（押している間、右ドラッグがrotZに切り替わる）
+      if ((e.key === 'z' || e.key === 'Z') && inputMode === 'mouse') {
+        zAxisLock = true;
+        hud('g-mouse', 'MOUSE : Z-LOCK ON [Z]', 'warn');
+      }
+      if (e.key === 'Enter') {
+        savedTransform = { px: pos.x, py: pos.y, pz: pos.z, rx: rotX, ry: rotY, rz: rotZ, sc: scale };
+        hud('g-mouse', 'MOUSE : COMMIT ✓', 'active', 1000);
+        console.log('[COMMIT]', savedTransform);
+      } else if (e.key === 'Escape') {
+        pos.set(savedTransform.px, savedTransform.py, savedTransform.pz);
+        rotX = savedTransform.rx; rotY = savedTransform.ry; rotZ = savedTransform.rz;
+        targetScale = savedTransform.sc;
+        vel.set(0,0,0); angVelX = angVelY = angVelZ = 0;
+        hud('g-mouse', 'MOUSE : CANCEL ↩', 'warn', 1000);
+      }
+    });
+
+    // ── 実験ゲームシステム ─────────────────────────────────────
+
+    // ターゲットゴースト（黄色ワイヤーフレーム）
+    const tgtGroup = new THREE.Group();
+    tgtGroup.add(new THREE.Mesh(
+      new THREE.TorusKnotGeometry(0.85, 0.27, 180, 28),
+      new THREE.MeshBasicMaterial({
+        color: 0xffdd00, wireframe: true, transparent: true, opacity: 0.65,
+      })
+    ));
+    tgtGroup.visible = false;
+    scene.add(tgtGroup);
+
+    // ゲーム状態
+    let gamePhase   = 'idle';
+    let phaseStart  = 0;
+    let holdStart   = null;
+    const HOLD_MS   = 1000;
+    const taskTimes = [0, 0, 0, 0];
+    const taskTols  = ['', '', '', ''];
+    let t4Round      = 0;
+    let t4Targets    = [];
+    let t4TotalStart = 0;
+    let transitioning = false;
+
+    // タスク定義
+    const T1 = { sc: 2.0, rx: 0,         ry: 0,         rz: 0, px: 0,   py: 0,   pz: 0 };
+    const T2 = { sc: 1,   rx: Math.PI/4, ry: Math.PI/3, rz: 0, px: 0,   py: 0,   pz: 0 };
+    const T3 = { sc: 1,   rx: 0,         ry: 0,         rz: 0, px: 2.4, py: 1.2, pz: 0 };
+
+    function rng(a, b) { return a + Math.random() * (b - a); }
+    function makeT4() {
+      return {
+        px: rng(-2.2, 2.2), py: rng(-1.4, 1.4), pz: 0,
+        rx: rng(-Math.PI * 0.6, Math.PI * 0.6),
+        ry: rng(-Math.PI * 0.6, Math.PI * 0.6),
+        rz: rng(-Math.PI * 0.3, Math.PI * 0.3),
+        sc: rng(0.5, 2.0),
+      };
+    }
+
+    const TOL_SC_INIT  = 0.05,  TOL_SC_STEP  = 0.05, TOL_SC_MAX  = 0.30;
+    const TOL_ROT_INIT = 15 * Math.PI / 180, TOL_ROT_STEP = 5 * Math.PI / 180, TOL_ROT_MAX = 50 * Math.PI / 180;
+    const TOL_POS_INIT = 0.20,  TOL_POS_STEP = 0.10, TOL_POS_MAX = 1.00;
+    let tolSc  = TOL_SC_INIT;
+    let tolRot = TOL_ROT_INIT;
+    let tolPos = TOL_POS_INIT;
+    let tolCarry    = 0;
+    let prevTolLevel = 0;
+
+    function showTolNotify() {
+      const el = document.getElementById('tol-notify');
+      el.innerHTML =
+        `⚠ 閾値が拡大されました<br>` +
+        `大きさ: ±${(tolSc*100).toFixed(0)}%　` +
+        `回転: ±${(tolRot*180/Math.PI).toFixed(0)}°　` +
+        `位置: ${tolPos.toFixed(2)}`;
+      el.style.display = 'block';
+      clearTimeout(el._t);
+      el._t = setTimeout(() => { el.style.display = 'none'; }, 3000);
+    }
+
+    // ── CSV ロギング ──────────────────────────────────────────
+    let csvInterval  = null;
+    let csvRows      = [];
+    let csvStartTime = 0;
+    let csvPhase     = '';
+
+    function csvHeaders(ph) {
+      if (ph === 'task1') return ['elapsed_s','scale','target_scale','tol_sc_pct'];
+      if (ph === 'task2') return ['elapsed_s','rotX_deg','rotY_deg','rotZ_deg','tgt_rotX_deg','tgt_rotY_deg','tgt_rotZ_deg','tol_rot_deg'];
+      if (ph === 'task3') return ['elapsed_s','pos_x','pos_y','tgt_x','tgt_y','tol_pos'];
+      return ['elapsed_s','round','scale','rotX_deg','rotY_deg','rotZ_deg','pos_x','pos_y',
+              'tgt_scale','tgt_rotX_deg','tgt_rotY_deg','tgt_rotZ_deg','tgt_x','tgt_y',
+              'tol_sc_pct','tol_rot_deg','tol_pos'];
+    }
+
+    function makeCsvRow(ph) {
+      const el = ((Date.now() - csvStartTime) / 1000).toFixed(1);
+      const t  = getCurTarget();
+      const rd = r => (r * 180 / Math.PI).toFixed(1);
+      if (ph === 'task1') return [el, scale.toFixed(3), t ? t.sc.toFixed(3) : '', (tolSc*100).toFixed(1)];
+      if (ph === 'task2') return [el, rd(rotX), rd(rotY), rd(rotZ),
+                                  t?rd(t.rx):'', t?rd(t.ry):'', t?rd(t.rz):'',
+                                  (tolRot*180/Math.PI).toFixed(1)];
+      if (ph === 'task3') return [el, pos.x.toFixed(3), pos.y.toFixed(3),
+                                  t?t.px.toFixed(3):'', t?t.py.toFixed(3):'', tolPos.toFixed(2)];
+      return [el, t4Round+1, scale.toFixed(3), rd(rotX), rd(rotY), rd(rotZ),
+              pos.x.toFixed(3), pos.y.toFixed(3),
+              t?t.sc.toFixed(3):'', t?rd(t.rx):'', t?rd(t.ry):'', t?rd(t.rz):'',
+              t?t.px.toFixed(3):'', t?t.py.toFixed(3):'',
+              (tolSc*100).toFixed(1), (tolRot*180/Math.PI).toFixed(1), tolPos.toFixed(2)];
+    }
+
+    function startCsvLog(ph) {
+      stopCsvLog();
+      csvPhase = ph; csvStartTime = Date.now();
+      csvRows  = [csvHeaders(ph)];
+      csvInterval = setInterval(() => csvRows.push(makeCsvRow(csvPhase)), 1000);
+    }
+
+    function stopCsvLog() {
+      if (csvInterval) { clearInterval(csvInterval); csvInterval = null; }
+    }
+
+    function downloadCsv(ph) {
+      if (!csvRows.length) return;
+      const content = '﻿' + csvRows.map(r => r.join(',')).join('\r\n');
+      const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+      const url  = URL.createObjectURL(blob);
+      const ts   = new Date().toISOString().slice(0,19).replace(/[T:]/g, '-');
+      const a    = Object.assign(document.createElement('a'), { href: url, download: `miraiCP_${ph}_${ts}.csv` });
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url); csvRows = [];
+    }
+
+    function normAng(a) {
+      while (a >  Math.PI) a -= 2 * Math.PI;
+      while (a < -Math.PI) a += 2 * Math.PI;
+      return a;
+    }
+
+    function getCurTarget() {
+      if (gamePhase === 'task1') return T1;
+      if (gamePhase === 'task2') return T2;
+      if (gamePhase === 'task3') return T3;
+      if (gamePhase === 'task4') return t4Targets[t4Round] || null;
+      return null;
+    }
+
+    function matchesTarget() {
+      const t = getCurTarget();
+      if (!t) return false;
+      const scOK  = Math.abs(scale - t.sc) / t.sc < tolSc;
+      const rotOK = Math.abs(normAng(rotX - t.rx)) < tolRot &&
+                    Math.abs(normAng(rotY - t.ry)) < tolRot &&
+                    Math.abs(normAng(rotZ - t.rz)) < tolRot;
+      const posOK = Math.hypot(pos.x - t.px, pos.y - t.py) < tolPos;
+      if (gamePhase === 'task1') return scOK;
+      if (gamePhase === 'task2') return rotOK;
+      if (gamePhase === 'task3') return posOK;
+      if (gamePhase === 'task4') return scOK && rotOK && posOK;
+      return false;
+    }
+
+    function syncTarget() {
+      const t = getCurTarget();
+      if (!t) { tgtGroup.visible = false; return; }
+      tgtGroup.visible = true;
+      tgtGroup.position.set(t.px, t.py, t.pz);
+      tgtGroup.rotation.set(t.rx, t.ry, t.rz);
+      tgtGroup.scale.setScalar(t.sc);
+    }
+
+    function resetObj() {
+      pos.set(0, 0, 0); vel.set(0, 0, 0);
+      rotX = rotY = rotZ = 0;
+      angVelX = angVelY = angVelZ = 0;
+      scale = 1; targetScale = 1;
+      grabbing = false; gripCounter = 0;
+    }
+
+    function setTaskLabel(text) {
+      const el = document.getElementById('task-label');
+      if (el) el.textContent = text;
+    }
+
+    function startPhase(phase) {
+      transitioning = false;
+      gamePhase  = phase;
+      phaseStart = Date.now();
+      holdStart  = null;
+      if (phase !== 'task4') {
+        tolSc  = TOL_SC_INIT;
+        tolRot = TOL_ROT_INIT;
+        tolPos = TOL_POS_INIT;
+        tolCarry = 0;
+        prevTolLevel = 0;
+      } else {
+        tolCarry = prevTolLevel;
+      }
+      startCsvLog(phase);
+      resetObj();
+      syncTarget();
+      const labels = {
+        task1: `【Task 1/4】スケール ${T1.sc.toFixed(1)}× に合わせて 1秒キープ`,
+        task2: `【Task 2/4】回転 X${(T2.rx*180/Math.PI).toFixed(0)}° Y${(T2.ry*180/Math.PI).toFixed(0)}° に合わせて 1秒キープ（許容±15°）`,
+        task3: `【Task 3/4】位置 (${T3.px.toFixed(1)}, ${T3.py.toFixed(1)}) に移動して 1秒キープ`,
+        task4: `【Task 4/4】統合 ${t4Round+1}/3 — 位置・回転・大きさを合わせて 1秒キープ`,
+      };
+      setTaskLabel(labels[phase] || '');
+      const fill = document.getElementById('hold-fill');
+      if (fill) { fill.style.width = '0%'; fill.classList.remove('matched'); }
+    }
+
+    function popResult(html, dur, cb) {
+      const el = document.getElementById('task-result');
+      el.innerHTML = html;
+      el.style.display = 'flex';
+      if (dur < 999000) setTimeout(() => { el.style.display = 'none'; if (cb) cb(); }, dur);
+    }
+
+    function popResultCountdown(html, sec, cb) {
+      const el = document.getElementById('task-result');
+      el.innerHTML = html;
+      el.style.display = 'flex';
+      setTimeout(() => { el.style.display = 'none'; if (cb) cb(); }, sec * 1000);
+    }
+
+    function onTaskClear() {
+      transitioning = true;
+      const elapsed  = ((Date.now() - phaseStart) / 1000).toFixed(2);
+      const snapSc   = (tolSc  * 100).toFixed(0);
+      const snapRot  = (tolRot * 180 / Math.PI).toFixed(0);
+      const snapPos  = tolPos.toFixed(2);
+      if (gamePhase === 'task1') {
+        taskTimes[0] = elapsed; taskTols[0] = `±${snapSc}%`;
+        stopCsvLog(); downloadCsv('task1');
+        popResultCountdown(
+          `<div style="font-size:26px">Task 1 クリア！✓</div>
+           <div style="font-size:44px;color:#0ff;margin:10px 0">${elapsed} 秒</div>
+           <div style="font-size:14px;color:#aaa">クリア時閾値: ±${snapSc}%</div>`,
+          5, () => startPhase('task2')
+        );
+      } else if (gamePhase === 'task2') {
+        taskTimes[1] = elapsed; taskTols[1] = `±${snapRot}°`;
+        stopCsvLog(); downloadCsv('task2');
+        popResultCountdown(
+          `<div style="font-size:26px">Task 2 クリア！✓</div>
+           <div style="font-size:44px;color:#0ff;margin:10px 0">${elapsed} 秒</div>
+           <div style="font-size:14px;color:#aaa">クリア時閾値: ±${snapRot}°</div>`,
+          5, () => startPhase('task3')
+        );
+      } else if (gamePhase === 'task3') {
+        taskTimes[2] = elapsed; taskTols[2] = `距離${snapPos}`;
+        stopCsvLog(); downloadCsv('task3');
+        popResultCountdown(
+          `<div style="font-size:26px">Task 3 クリア！✓</div>
+           <div style="font-size:44px;color:#0ff;margin:10px 0">${elapsed} 秒</div>
+           <div style="font-size:14px;color:#aaa">クリア時閾値: 距離${snapPos}</div>`,
+          5, () => {
+            t4Round = 0;
+            t4Targets = Array.from({ length: 3 }, makeT4);
+            t4TotalStart = Date.now();
+            startPhase('task4');
+          }
+        );
+      } else if (gamePhase === 'task4') {
+        t4Round++;
+        if (t4Round >= 3) {
+          const total = ((Date.now() - t4TotalStart) / 1000).toFixed(2);
+          taskTimes[3] = total; taskTols[3] = `SC:±${snapSc}% ROT:±${snapRot}° POS:${snapPos}`;
+          stopCsvLog(); downloadCsv('task4');
+          gamePhase = 'done';
+          tgtGroup.visible = false;
+          setTaskLabel('全タスク完了！');
+          popResultCountdown(
+            `<div style="font-size:24px;margin-bottom:14px">全タスク完了！</div>
+             <div style="line-height:2.2;font-size:17px">
+               Task 1 スケール　<b style="color:#0ff">${taskTimes[0]} s</b>　<span style="font-size:12px;color:#888">${taskTols[0]}</span><br>
+               Task 2 回転　　　<b style="color:#0ff">${taskTimes[1]} s</b>　<span style="font-size:12px;color:#888">${taskTols[1]}</span><br>
+               Task 3 位置　　　<b style="color:#0ff">${taskTimes[2]} s</b>　<span style="font-size:12px;color:#888">${taskTols[2]}</span><br>
+               Task 4 統合×3　<b style="color:#0ff">${taskTimes[3]} s</b>　<span style="font-size:12px;color:#888">${taskTols[3]}</span>
+             </div>
+             <div style="margin-top:16px;font-size:13px;color:#666">10秒後にスタート画面に戻ります</div>`,
+            10, resetGame
+          );
+        } else {
+          transitioning = false;
+          holdStart = null;
+          const fill = document.getElementById('hold-fill');
+          if (fill) { fill.style.width = '0%'; fill.classList.remove('matched'); }
+          syncTarget();
+          setTaskLabel(`【Task 4/4】統合 ${t4Round+1}/3 — 位置・回転・大きさを合わせて 1秒キープ`);
+        }
+      }
+    }
+
+    function resetGame() {
+      gamePhase = 'idle';
+      t4Round = 0; t4Targets = []; transitioning = false;
+      taskTimes.fill(0); taskTols.fill('');
+      tolSc = TOL_SC_INIT; tolRot = TOL_ROT_INIT; tolPos = TOL_POS_INIT;
+      tolCarry = 0; prevTolLevel = 0;
+      stopCsvLog();
+      resetObj();
+      tgtGroup.visible = false;
+      document.getElementById('task-result').style.display  = 'none';
+      document.getElementById('game-hud').style.display     = 'none';
+      document.getElementById('start-overlay').style.display = 'flex';
+      setTaskLabel('');
+      const fill = document.getElementById('hold-fill');
+      if (fill) { fill.style.width = '0%'; fill.classList.remove('matched'); }
+    }
+
+    function r2d(r) { return ((r * 180 / Math.PI) % 360).toFixed(1); }
+
+    function gameTick() {
+      if (gamePhase === 'idle' || gamePhase === 'done' || transitioning) return;
+
+      // 30秒ごとに閾値拡大（上限なし、task4は前タスクの閾値を引き継ぎ）
+      const tolLevel = tolCarry + Math.floor((Date.now() - phaseStart) / 30000);
+      tolSc  = TOL_SC_INIT  + tolLevel * TOL_SC_STEP;
+      tolRot = TOL_ROT_INIT + tolLevel * TOL_ROT_STEP;
+      tolPos = TOL_POS_INIT + tolLevel * TOL_POS_STEP;
+      if (tolLevel !== prevTolLevel) {
+        prevTolLevel = tolLevel;
+        showTolNotify();
+      }
+
+      syncTarget();
+
+      // 現在値 / 目標値を表示
+      const t   = getCurTarget();
+      const cur = document.getElementById('cur-state');
+      if (cur && t) {
+        const scMatch  = Math.abs(scale - t.sc) / t.sc < tolSc;
+        const rxMatch  = Math.abs(normAng(rotX - t.rx)) < tolRot;
+        const ryMatch  = Math.abs(normAng(rotY - t.ry)) < tolRot;
+        const rzMatch  = Math.abs(normAng(rotZ - t.rz)) < tolRot;
+        const posMatch = Math.hypot(pos.x - t.px, pos.y - t.py) < tolPos;
+
+        const ok  = s => `<span style="color:#00ff88">${s}</span>`;
+        const ng  = s => `<span style="color:#ff4444">${s}</span>`;
+        const dim = s => `<span style="color:#555">${s}</span>`;
+
+        const scLine  = `大きさ　現在 ${(scMatch?ok:ng)(scale.toFixed(2)+'×')}　目標 ${dim(t.sc.toFixed(2)+'×')}　${dim('[許容±'+(tolSc*100).toFixed(0)+'%]')}`;
+        const posLine = `位置　　現在 ${(posMatch?ok:ng)('('+pos.x.toFixed(2)+', '+pos.y.toFixed(2)+')')}　目標 ${dim('('+t.px.toFixed(2)+', '+t.py.toFixed(2)+')')}　${dim('[許容'+tolPos.toFixed(2)+']')}`;
+        const rxLine  = `回転X　現在 ${(rxMatch?ok:ng)(r2d(rotX)+'°')}　目標 ${dim(r2d(t.rx)+'°')}`;
+        const ryLine  = `回転Y　現在 ${(ryMatch?ok:ng)(r2d(rotY)+'°')}　目標 ${dim(r2d(t.ry)+'°')}`;
+        const rzLine  = `回転Z　現在 ${(rzMatch?ok:ng)(r2d(rotZ)+'°')}　目標 ${dim(r2d(t.rz)+'°')}　${dim('[許容±'+(tolRot*180/Math.PI).toFixed(0)+'°]')}`;
+
+        if (gamePhase === 'task1') cur.innerHTML = scLine;
+        else if (gamePhase === 'task2') cur.innerHTML = [rxLine, ryLine, rzLine].join('<br>');
+        else if (gamePhase === 'task3') cur.innerHTML = posLine;
+        else cur.innerHTML = [scLine, posLine, rxLine, ryLine, rzLine].join('<br>');
+      }
+
+      const fill = document.getElementById('hold-fill');
+      if (matchesTarget()) {
+        if (holdStart === null) holdStart = Date.now();
+        const pct = Math.min((Date.now() - holdStart) / HOLD_MS * 100, 100);
+        if (fill) { fill.style.width = pct + '%'; fill.classList.add('matched'); }
+        if (Date.now() - holdStart >= HOLD_MS) onTaskClear();
+      } else {
+        holdStart = null;
+        if (fill) { fill.style.width = '0%'; fill.classList.remove('matched'); }
+      }
+    }
+
+    document.getElementById('start-btn').addEventListener('click', () => {
+      document.getElementById('start-overlay').style.display = 'none';
+      document.getElementById('game-hud').style.display      = 'block';
+      startPhase('task1');
+    });
+
     // ── アニメーション ────────────────────────────────────────
     const clock = new THREE.Clock();
 
@@ -422,32 +979,35 @@
       requestAnimationFrame(animate);
       const t = clock.getElapsedTime();
 
-      // 位置：バネ物理
       vel.multiplyScalar(POS_D);
       pos.add(vel);
 
-      // スケール補間
       scale += (targetScale - scale) * 0.12;
 
-      // オブジェクトに反映
       objGroup.position.copy(pos);
       objGroup.rotation.set(rotX, rotY, rotZ);
       objGroup.scale.setScalar(scale);
 
-      // グラブ中はホログラム色が変わる
       holoMat.emissive.setHex(grabbing ? 0x003366 : 0x0044bb);
       holoMat.opacity = (grabbing ? 0.85 : 0.72) + Math.sin(t * 2.5) * 0.04;
       holoMat.emissiveIntensity = (grabbing ? 1.0 : 0.6) + Math.sin(t * 4) * 0.2;
       glowMat.opacity = grabbing ? 0.45 : 0.25;
 
-      // トレイル
       trailPts.push(objGroup.position.clone());
       if (trailPts.length > TRAIL_MAX) trailPts.shift();
       if (trailPts.length >= 2) trailGeo.setFromPoints(trailPts);
 
+      gameTick();
       renderer.render(scene, camera);
     }
     animate();
+
+    window.addEventListener('keyup', e => {
+      if (e.key === 'z' || e.key === 'Z') {
+        zAxisLock = false;
+        if (inputMode === 'mouse') hud('g-mouse', 'MOUSE : ---', 'dim');
+      }
+    });
 
     window.addEventListener('resize', () => {
       camera.aspect = innerWidth / innerHeight;
